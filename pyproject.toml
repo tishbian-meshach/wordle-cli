@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wordle-cli"
+version = "0.1.0"
+description = "Minimal terminal Wordle with colored text and keyboard tracking"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [
+    { name = "Tishbian Meshach" }
+]
+
+[project.scripts]
+wordle = "wordle_cli.game:main"
+
+[tool.setuptools]
+packages = ["wordle_cli"]
