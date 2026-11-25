@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import readline
 import sys
 from pathlib import Path
@@ -49,10 +50,34 @@ def get_total_correct() -> int:
 
 QWERTY_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
 
+# Wordle (dark theme) palette, 256-colour approximations
+TILE_BG = {"correct": 71, "present": 178, "absent": 238, "empty": 235}
+KEY_BG = {"correct": 71, "present": 178, "absent": 236, None: 245}
+WHITE = 255
+DIM_FG = 242
 
-def colorize(letter: str, status: str) -> str:
-    color = {"correct": GREEN, "present": YELLOW, "absent": GRAY}[status]
-    return f"{color}{letter.upper()}{RESET}"
+BOARD_W = WORD_LEN * 4 - 1           # " A " tiles + 1-space gaps
+KEYS_W = len(QWERTY_ROWS[0]) * 4 - 1
+LEFT_W = BOARD_W + 6
+RIGHT_W = KEYS_W + 6
+BOARD_H = MAX_TRIES * 2 - 1
+
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
+def pad(text: str, width: int, align: str = "left") -> str:
+    gap = max(0, width - visible_len(text))
+    if align == "center":
+        return " " * (gap // 2) + text + " " * (gap - gap // 2)
+    return text + " " * gap
+
+
+def cell(letter: str, bg: int, fg: int = WHITE) -> str:
+    return f"\033[1;38;5;{fg};48;5;{bg}m {letter.upper()} {RESET}"
 
 
 def score_guess(guess: str, answer: str):
@@ -74,51 +99,59 @@ def score_guess(guess: str, answer: str):
     return result
 
 
-def render_keyboard(letter_status: dict, top_line: str = None, previous_guesses: list = None):
-    if previous_guesses is None:
-        previous_guesses = []
+def render_board(history: list) -> list:
+    lines = []
+    for row in range(MAX_TRIES):
+        if row < len(history):
+            guess, result = history[row]
+            tiles = [cell(g, TILE_BG[s]) for g, s in zip(guess, result)]
+        else:
+            tiles = [cell("·", TILE_BG["empty"], DIM_FG)] * WORD_LEN
+        lines.append(" ".join(tiles))
+        if row < MAX_TRIES - 1:
+            lines.append("")
+    return lines
 
-    left_lines = []
-    vis_lengths = []
 
-    if top_line is not None:
-        left_lines.append(top_line)
-        vis_lengths.append(2 * WORD_LEN - 1)
-
-    row_lengths = [19, 17, 13]
-    for i, row in enumerate(QWERTY_ROWS):
-        parts = []
+def render_keys(letter_status: dict) -> list:
+    lines = []
+    for row in QWERTY_ROWS:
+        keys = []
         for ch in row:
             status = letter_status.get(ch)
-            if status == "correct":
-                parts.append(f"{GREEN}{ch.upper()}{RESET}")
-            elif status == "present":
-                parts.append(f"{YELLOW}{ch.upper()}{RESET}")
-            elif status == "absent":
-                parts.append(f"{GRAY}{ch.upper()}{RESET}")
-            else:
-                parts.append(ch.upper())
-        left_lines.append(" ".join(parts))
-        vis_lengths.append(row_lengths[i])
+            fg = DIM_FG if status == "absent" else WHITE
+            keys.append(cell(ch, KEY_BG[status], fg))
+        lines.append(" ".join(keys))
+        lines.append("")
+    return lines[:-1]
 
-    KEYBOARD_WIDTH = 19
-    GAP = "      "
-    max_lines = max(len(left_lines), len(previous_guesses))
-    output_lines = []
-    for i in range(max_lines):
-        if i < len(left_lines):
-            part = left_lines[i]
-            padding = " " * (KEYBOARD_WIDTH - vis_lengths[i])
-            left = part + padding
-        else:
-            left = " " * KEYBOARD_WIDTH
 
-        if i < len(previous_guesses):
-            output_lines.append(left + GAP + previous_guesses[i])
-        else:
-            output_lines.append(left.rstrip())
+def render_screen(history: list, letter_status: dict, message: str = "") -> str:
+    """Two-pane box: guess board on the left, keyboard on the right."""
+    board = render_board(history)
+    right = render_keys(letter_status)
+    right = [""] * max(0, (BOARD_H - len(right)) // 2) + right
+    height = max(BOARD_H, len(right)) + 2
 
-    return "\n".join(output_lines)
+    board = [""] + board + [""] * (height - len(board) - 1)
+    right = [""] + right + [""] * (height - len(right) - 1)
+
+    out = ["╭" + "─" * LEFT_W + "┬" + "─" * RIGHT_W + "╮"]
+    for b, r in zip(board, right):
+        out.append("│" + pad(b, LEFT_W, "center") + "│" + pad(r, RIGHT_W, "center") + "│")
+    out.append("├" + "─" * LEFT_W + "┴" + "─" * RIGHT_W + "┤")
+    out.append("│" + pad(" " + message, LEFT_W + RIGHT_W + 1) + "│")
+    out.append("╰" + "─" * (LEFT_W + RIGHT_W + 1) + "╯")
+    return "\n".join(out)
+
+
+def redraw(region_lines: int, header: str, screen: str) -> int:
+    """Replace the previous prompt + box in place; returns lines now in the region."""
+    if region_lines and sys.stdout.isatty():
+        sys.stdout.write(f"\033[{region_lines}F\033[J")
+    print(header)
+    print(screen)
+    return 1 + screen.count("\n") + 1
 
 
 def play():
@@ -128,65 +161,55 @@ def play():
     print(" " * 30, end="\r")  # clear the loading line
 
     answer = random.choice(answers)
+    rank = {"correct": 2, "present": 1, "absent": 0}
 
     letter_status = {}
-    guesses_made = 0
-    found_green = [None] * WORD_LEN
-    previous_guesses = []
+    history = []
+    region = 0  # terminal lines used by the current prompt + box
 
-    while guesses_made < MAX_TRIES:
-        remaining = MAX_TRIES - guesses_made
+    while len(history) < MAX_TRIES:
+        remaining = MAX_TRIES - len(history)
+        prompt = f"{BOLD}[{remaining}]{RESET} "
         try:
-            raw_input = input(f"{BOLD}[{remaining}]{RESET} ")
+            raw_input = input(prompt)
             guess = raw_input.strip().lower()
             if raw_input:
                 readline.add_history(raw_input)
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(0)
+        region += 1
+        header = prompt + guess
 
         if len(guess) != WORD_LEN or not guess.isalpha():
-            print(f"{GRAY}enter a {WORD_LEN}-letter word{RESET}")
-            top_line = " ".join(colorize(char, "correct") if char is not None else "_" for char in found_green)
-            print(render_keyboard(letter_status, top_line, previous_guesses))
-            print()
+            message = f"{YELLOW}enter a {WORD_LEN}-letter word{RESET}"
+            region = redraw(region, header, render_screen(history, letter_status, message))
             continue
-
         if guess not in valid_words:
-            print(f"{GRAY}not in word list{RESET}")
-            top_line = " ".join(colorize(char, "correct") if char is not None else "_" for char in found_green)
-            print(render_keyboard(letter_status, top_line, previous_guesses))
-            print()
+            message = f"{YELLOW}{guess.upper()}{RESET} {GRAY}is not in word list{RESET}"
+            region = redraw(region, header, render_screen(history, letter_status, message))
             continue
 
         result = score_guess(guess, answer)
-        guesses_made += 1
-
-        for i in range(WORD_LEN):
-            if result[i] == "correct":
-                found_green[i] = guess[i]
-
-        colored = " ".join(colorize(g, s) for g, s in zip(guess, result))
-
+        history.append((guess, result))
         for g, s in zip(guess, result):
             current = letter_status.get(g)
-            rank = {"correct": 2, "present": 1, "absent": 0}
             if current is None or rank[s] > rank[current]:
                 letter_status[g] = s
-
-        print(render_keyboard(letter_status, colored, previous_guesses))
-        print()
-        previous_guesses.append(colored)
+        message = ""
 
         if guess == answer:
-            total = record_correct_word(answer)
-            print(f"{GREEN}{BOLD}{answer.upper()}{RESET}")
-            print(f"{GRAY}Total words correctly guessed: {RESET}{BOLD}{GREEN}{total}{RESET}")
+            record_correct_word(answer)
+            praise = ["Genius", "Magnificent", "Impressive", "Splendid", "Great", "Phew"][len(history) - 1]
+            message = (f"{GREEN}{BOLD}{praise}!{RESET} {GRAY}solved in{RESET} "
+                       f"{BOLD}{len(history)}/{MAX_TRIES}{RESET}")
+            redraw(region, header, render_screen(history, letter_status, message))
             return
 
-    total = get_total_correct()
-    print(f"{GRAY}{answer.upper()}{RESET}")
-    print(f"{GRAY}Total words correctly guessed: {RESET}{BOLD}{total}{RESET}")
+        region = redraw(region, header, render_screen(history, letter_status, message))
+
+    message = f"{GRAY}the word was{RESET} {BOLD}{answer.upper()}{RESET}"
+    region = redraw(region, header, render_screen(history, letter_status, message))
 
 
 def main():
