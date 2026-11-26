@@ -5,6 +5,11 @@ A lightweight, beautiful, terminal-based Wordle game built in Python. Play Wordl
 ![Python Version](https://img.shields.io/badge/python-3.7+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+<p>
+  <img src="screenshots/menu.png" alt="Main menu" width="49%">
+  <img src="screenshots/game.png" alt="Game in progress" width="49%">
+</p>
+
 ---
 
 ## 🚀 Installation
