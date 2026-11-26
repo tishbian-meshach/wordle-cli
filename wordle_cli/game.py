@@ -109,8 +109,15 @@ def box(columns: list, widths: list, footer: str = None) -> list:
     return out
 
 
+SCREEN_H = BOARD_H + 4  # height of the game box; every screen uses exactly this size
+
+
 def panel(lines: list, footer: str = None) -> list:
-    return box([[""] + lines + [""]], [INNER_W], footer)
+    """Single-pane box, same size as the game box, content centred vertically."""
+    rows = SCREEN_H - (2 if footer is None else 4)
+    lines = lines[:rows]
+    top = (rows - len(lines)) // 2
+    return box([[""] * top + lines + [""] * (rows - len(lines) - top)], [INNER_W], footer)
 
 
 def logo() -> list:
@@ -378,7 +385,7 @@ class App:
                     rows.append(f"{GREEN}{BOLD}▸ {label:<16}{RESET}{GRAY}{desc}{RESET}")
                 else:
                     rows.append(f"  {label:<16}{GRAY}{desc}{RESET}")
-            lines = logo() + [""] + block(rows) + [""]
+            lines = logo() + [""] + block(rows)
             footer = spread(dim("↑↓ move · enter select"), dim("q quit"))
             self.term.paint(panel(lines, footer))
 
@@ -584,17 +591,17 @@ class App:
                 width = round(30 * count / top)
                 bars.append(f"{i + 1} \033[1;38;5;{WHITE};48;5;{bg}m{' ' * width} {count} {RESET}")
 
-            lines = [tabs, "", "",
+            lines = [tabs, "",
                      "".join(pad(f"{BOLD}{n}{RESET}", 12, "center") for n in numbers),
                      "".join(pad(dim(label), 12, "center") for label in labels),
-                     "", "", dim("guess distribution"), ""]
-            lines += block(bars)
+                     ""] + [pad(bar, 38) for bar in bars]  # fixed width: no shifting between tabs
             if mode == "campaign":
                 total = puzzle_number(date.today()) + 1
                 done = min(self.store.campaign_next, total)
-                lines += ["", dim(f"progress {done}/{total} · {100 * done // total}% of all Wordles played")]
-            footer = spread(dim("←→ switch · esc back"),
-                            dim("lifetime words solved ") + f"{GREEN}{BOLD}{self.store.total_correct}{RESET}")
+                extra = dim("campaign ") + f"{BOLD}{done}/{total}{RESET}" + dim(f" · {100 * done // total}%")
+            else:
+                extra = dim("lifetime words solved ") + f"{GREEN}{BOLD}{self.store.total_correct}{RESET}"
+            footer = spread(dim("←→ switch · esc back"), extra)
             self.term.paint(panel(lines, footer))
 
             k = self.key()
@@ -608,24 +615,17 @@ class App:
     def help_screen(self):
         sample = [("w", "correct"), ("e", "present"), ("a", "absent")]
         lines = block([
-            f"{BOLD}How to play{RESET}",
-            f"Guess the hidden word in {MAX_TRIES} tries; each guess must be a real word.",
+            f"{BOLD}How to play{RESET}  guess the hidden word in {MAX_TRIES} tries",
+            " ".join(cell(ch, TILE_BG[s]) for ch, s in sample)
+            + dim("  right spot · in the word, wrong spot · not in it"),
             "",
-            "  ".join(cell(ch, TILE_BG[s]) for ch, s in sample)
-            + dim("   right spot · in the word, wrong spot · not in it"),
+            f"{BOLD}Today{RESET}       the official Wordle of the day      {dim('wordle -t')}",
+            f"{BOLD}Random{RESET}      endless practice with past answers  {dim('wordle -n')}",
+            f"{BOLD}Campaign{RESET}    every Wordle from #0, day by day    {dim('wordle -c')}",
+            f"{BOLD}Statistics{RESET}  streaks and guess distribution      {dim('wordle -s')}",
+            f"{BOLD}Hard mode{RESET}   revealed hints must be reused       {dim('wordle -H')}",
             "",
-            f"{BOLD}Modes{RESET}",
-            f"  Today       the official Wordle of the day       {dim('wordle -t')}",
-            f"  Random      endless practice with past answers   {dim('wordle -n')}",
-            f"  Campaign    every Wordle from #0, day by day     {dim('wordle -c')}",
-            f"  Statistics  streaks and guess distribution       {dim('wordle -s')}",
-            "",
-            f"{BOLD}Keys{RESET}",
-            "  type to fill the row · enter submit · backspace delete",
-            "  esc back to the menu (your game is saved) · ctrl-c quit",
-            "",
-            f"{BOLD}Hard mode{RESET}  {dim('h in the menu, or wordle -H')}",
-            "  revealed hints must be used in every later guess",
+            f"{BOLD}Keys{RESET}  enter submit · ⌫ delete · esc menu (saved) · ctrl-c quit",
         ])
         self.term.paint(panel(lines, dim("press any key")))
         self.key()
