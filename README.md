@@ -19,19 +19,26 @@ pip install git+https://github.com/tishbian-meshach/wordle-cli
 
 ## 🎮 How to Play
 
-Once installed, simply run:
-
 ```bash
-wordle
+wordle        # menu: pick a mode, view stats, toggle hard mode
+wordle -t     # today's official Wordle
+wordle -n     # endless random past Wordles
+wordle -c     # campaign: every Wordle from #0, day by day
+wordle -s     # statistics
+wordle -H     # turn hard mode on (remembered)
 ```
+
+The game runs full-screen and stays open until you quit (`q` in the menu, or `Ctrl-C`).
+Type letters straight into the tiles, `Enter` to submit, `Backspace` to delete, `Esc` to go back
+to the menu. Unfinished games are saved and resumed.
 
 ### Game Rules
 - Guess the **5-letter word** in 6 tries or less.
-- After each guess, the color of the letters will change to show how close your guess was to the target word:
-  - 🟩 **Green**: The letter is in the word and in the correct position.
-  - 🟨 **Yellow**: The letter is in the word but in the wrong position.
-  - ⬜ **Gray**: The letter is not in the word.
-- Below each guess, an updated **QWERTY keyboard layout** is rendered showing the letter states to help you plan your next move.
+- After each guess, the tiles change colour to show how close your guess was:
+  - 🟩 **Green**: the letter is in the word and in the correct position.
+  - 🟨 **Yellow**: the letter is in the word but in the wrong position.
+  - ⬜ **Gray**: the letter is not in the word.
+- **Hard mode**: revealed hints must be used in every later guess.
 
 ---
 
@@ -39,6 +46,7 @@ wordle
 
 - 🎨 **ANSI Terminal Colors**: Clean, high-contrast visual display of letter guesses.
 - ⌨️ **QWERTY Keyboard Tracker**: Keeps track of correct, misplaced, and invalid letters on a rendered keyboard.
+- 📊 **Statistics**: Played, win %, streaks and guess distribution per mode, stored in `~/.cache/wordle_cli/stats.json`.
 - 🔄 **Dynamic Wordlist Caching**: Automatic local caching for fast gameplay startup.
 - ⚡ **Zero External Dependencies**: Pure Python standard library implementation.
 

@@ -1,57 +1,33 @@
-import json
+"""Full-screen terminal Wordle: menu, today / random / campaign modes, stats."""
+import argparse
+import os
 import random
 import re
-import readline
+import shutil
+import signal
 import sys
-from pathlib import Path
-from .wordlist import get_answers, get_valid_guesses
+import termios
+import time
+import tty
+from collections import Counter
+from datetime import date, datetime, timedelta
 
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
+from .store import MAX_TRIES, Store
+from .wordlist import FALLBACK_WORDS, WORDLE_LAUNCH, get_daily_word, get_valid_guesses
+
+GREEN = "\033[38;5;77m"
+YELLOW = "\033[38;5;178m"
 GRAY = "\033[90m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
-MAX_TRIES = 6
 WORD_LEN = 5
-
-CACHE_DIR = Path.home() / ".cache" / "wordle_cli"
-STATS_FILE = CACHE_DIR / "stats.json"
-
-
-def load_stats() -> dict:
-    if STATS_FILE.exists():
-        try:
-            return json.loads(STATS_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"total_correct": 0, "words": []}
-
-
-def record_correct_word(word: str) -> int:
-    stats = load_stats()
-    stats["total_correct"] = stats.get("total_correct", 0) + 1
-    words = stats.get("words", [])
-    if word not in words:
-        words.append(word)
-    stats["words"] = words
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        STATS_FILE.write_text(json.dumps(stats, indent=2))
-    except OSError:
-        pass
-    return stats["total_correct"]
-
-
-def get_total_correct() -> int:
-    stats = load_stats()
-    return stats.get("total_correct", 0)
-
-
 QWERTY_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+RANK = {"correct": 2, "present": 1, "absent": 0}
 
 # Wordle (dark theme) palette, 256-colour approximations
-TILE_BG = {"correct": 71, "present": 178, "absent": 238, "empty": 235}
+TILE_BG = {"correct": 71, "present": 178, "absent": 238, "empty": 235,
+           "pending": 240, "typed": 240, "slot": 237}
 KEY_BG = {"correct": 71, "present": 178, "absent": 236, None: 245}
 WHITE = 255
 DIM_FG = 242
@@ -60,11 +36,21 @@ BOARD_W = WORD_LEN * 4 - 1           # " A " tiles + 1-space gaps
 KEYS_W = len(QWERTY_ROWS[0]) * 4 - 1
 LEFT_W = BOARD_W + 6
 RIGHT_W = KEYS_W + 6
+INNER_W = LEFT_W + RIGHT_W + 1
+BOX_W = INNER_W + 2
 BOARD_H = MAX_TRIES * 2 - 1
 
-ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+PRAISE = ["Genius", "Magnificent", "Impressive", "Splendid", "Great", "Phew"]
+ORDINAL = ["1st", "2nd", "3rd", "4th", "5th"]
+MODE_NAMES = {"daily": "Today", "random": "Random", "campaign": "Campaign"}
+FETCH_ERRORS = (OSError, ValueError, KeyError)  # URLError/HTTPError/timeouts are OSErrors
+
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
 
 
+# --------------------------------------------------------------------------- #
+# rendering helpers
+# --------------------------------------------------------------------------- #
 def visible_len(text: str) -> int:
     return len(ANSI_RE.sub("", text))
 
@@ -73,13 +59,57 @@ def pad(text: str, width: int, align: str = "left") -> str:
     gap = max(0, width - visible_len(text))
     if align == "center":
         return " " * (gap // 2) + text + " " * (gap - gap // 2)
+    if align == "right":
+        return " " * gap + text
     return text + " " * gap
+
+
+def block(lines: list) -> list:
+    """Pad lines to a common width so a centred block stays left-aligned."""
+    width = max((visible_len(line) for line in lines), default=0)
+    return [pad(line, width) for line in lines]
 
 
 def cell(letter: str, bg: int, fg: int = WHITE) -> str:
     return f"\033[1;38;5;{fg};48;5;{bg}m {letter.upper()} {RESET}"
 
 
+def dim(text: str) -> str:
+    return f"{GRAY}{text}{RESET}"
+
+
+def spread(left: str, right: str, width: int = INNER_W - 2) -> str:
+    return left + " " * max(1, width - visible_len(left) - visible_len(right)) + right
+
+
+def box(columns: list, widths: list, footer: str = None) -> list:
+    height = max(len(col) for col in columns)
+    columns = [col + [""] * (height - len(col)) for col in columns]
+    out = ["╭" + "┬".join("─" * w for w in widths) + "╮"]
+    for row in zip(*columns):
+        out.append("│" + "│".join(pad(t, w, "center") for t, w in zip(row, widths)) + "│")
+    if footer is None:
+        out.append("╰" + "┴".join("─" * w for w in widths) + "╯")
+    else:
+        total = sum(widths) + len(widths) - 1
+        out.append("├" + "┴".join("─" * w for w in widths) + "┤")
+        out.append("│" + pad(" " + footer, total) + "│")
+        out.append("╰" + "─" * total + "╯")
+    return out
+
+
+def panel(lines: list, footer: str = None) -> list:
+    return box([[""] + lines + [""]], [INNER_W], footer)
+
+
+def logo() -> list:
+    colours = ["correct", "present", "absent", "correct", "present", "absent"]
+    return [" ".join(cell(ch, TILE_BG[c]) for ch, c in zip("wordle", colours))]
+
+
+# --------------------------------------------------------------------------- #
+# game rules
+# --------------------------------------------------------------------------- #
 def score_guess(guess: str, answer: str):
     result = ["absent"] * WORD_LEN
     answer_chars = list(answer)
@@ -99,125 +129,474 @@ def score_guess(guess: str, answer: str):
     return result
 
 
-def render_board(history: list) -> list:
+def hard_mode_error(guess: str, history: list):
+    """Revealed hints must be reused: greens stay put, yellows must appear."""
+    for prev, result in history:
+        for i, (ch, status) in enumerate(zip(prev, result)):
+            if status == "correct" and guess[i] != ch:
+                return f"{ORDINAL[i]} letter must be {ch.upper()}"
+        needed = Counter(ch for ch, status in zip(prev, result) if status != "absent")
+        have = Counter(guess)
+        for ch, count in needed.items():
+            if have[ch] < count:
+                return f"guess must contain {ch.upper()}"
+    return None
+
+
+class Game:
+    def __init__(self, mode: str, key: str, answer: str, title: str, hard: bool,
+                 guesses=(), day: date = None, number: int = None):
+        self.mode, self.key, self.answer, self.title = mode, key, answer, title
+        self.hard, self.day, self.number = hard, day, number
+        self.history, self.status, self.current = [], {}, ""
+        for guess in guesses:
+            self.apply(guess)
+
+    def apply(self, guess: str):
+        result = score_guess(guess, self.answer)
+        self.history.append((guess, result))
+        for ch, status in zip(guess, result):
+            known = self.status.get(ch)
+            if known is None or RANK[status] > RANK[known]:
+                self.status[ch] = status
+
+    @property
+    def guesses(self) -> list:
+        return [guess for guess, _ in self.history]
+
+    @property
+    def won(self) -> bool:
+        return bool(self.history) and self.history[-1][0] == self.answer
+
+    @property
+    def over(self) -> bool:
+        return self.won or len(self.history) >= MAX_TRIES
+
+
+def render_board(history: list, current: str = None) -> list:
+    """current=None hides the typing row (game over / revealing)."""
     lines = []
     for row in range(MAX_TRIES):
         if row < len(history):
             guess, result = history[row]
             tiles = [cell(g, TILE_BG[s]) for g, s in zip(guess, result)]
+        elif row == len(history) and current is not None:
+            tiles = ([cell(ch, TILE_BG["typed"]) for ch in current]
+                     + [cell(" ", TILE_BG["slot"])] * (WORD_LEN - len(current)))
         else:
             tiles = [cell("·", TILE_BG["empty"], DIM_FG)] * WORD_LEN
         lines.append(" ".join(tiles))
-        if row < MAX_TRIES - 1:
-            lines.append("")
-    return lines
+        lines.append("")
+    return lines[:-1]
 
 
 def render_keys(letter_status: dict) -> list:
     lines = []
-    for row in QWERTY_ROWS:
+    for i, row in enumerate(QWERTY_ROWS):
         keys = []
         for ch in row:
             status = letter_status.get(ch)
-            fg = DIM_FG if status == "absent" else WHITE
-            keys.append(cell(ch, KEY_BG[status], fg))
+            keys.append(cell(ch, KEY_BG[status], DIM_FG if status == "absent" else WHITE))
+        if i == len(QWERTY_ROWS) - 1:
+            keys = [cell("enter", KEY_BG[None])] + keys + [cell("⌫", KEY_BG[None])]
         lines.append(" ".join(keys))
         lines.append("")
     return lines[:-1]
 
 
-def render_screen(history: list, letter_status: dict, message: str = "") -> str:
-    """Two-pane box: guess board on the left, keyboard on the right."""
-    board = render_board(history)
-    right = render_keys(letter_status)
-    right = [""] * max(0, (BOARD_H - len(right)) // 2) + right
-    height = max(BOARD_H, len(right)) + 2
+# --------------------------------------------------------------------------- #
+# terminal
+# --------------------------------------------------------------------------- #
+class Terminal:
+    """Raw-ish key input on the alternate screen; restores the terminal on exit."""
 
-    board = [""] + board + [""] * (height - len(board) - 1)
-    right = [""] + right + [""] * (height - len(right) - 1)
+    def __enter__(self):
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
+        sys.stdout.flush()
+        self.last = []
+        signal.signal(signal.SIGWINCH, lambda *_: self.paint())
+        return self
 
-    out = ["╭" + "─" * LEFT_W + "┬" + "─" * RIGHT_W + "╮"]
-    for b, r in zip(board, right):
-        out.append("│" + pad(b, LEFT_W, "center") + "│" + pad(r, RIGHT_W, "center") + "│")
-    out.append("├" + "─" * LEFT_W + "┴" + "─" * RIGHT_W + "┤")
-    out.append("│" + pad(" " + message, LEFT_W + RIGHT_W + 1) + "│")
-    out.append("╰" + "─" * (LEFT_W + RIGHT_W + 1) + "╯")
-    return "\n".join(out)
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGWINCH, signal.SIG_DFL)
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+    def key(self):
+        data = os.read(self.fd, 32).decode(errors="ignore")
+        keys = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace",
+                "\x1b": "esc", "\x04": "quit",
+                "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+                "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left"}
+        if data in keys:
+            return keys[data]
+        if len(data) == 1 and data.isprintable():
+            return data
+        return None
+
+    def paint(self, lines: list = None):
+        """Draw lines centred on screen, overwriting the previous frame."""
+        if lines is not None:
+            self.last = lines
+        lines = self.last
+        if not lines:
+            return
+        cols, rows = shutil.get_terminal_size()
+        width = max(visible_len(line) for line in lines)
+        if cols < width or rows < len(lines):
+            lines = [f"enlarge the terminal to {width}×{len(lines)} (now {cols}×{rows})"]
+            width = visible_len(lines[0])
+        left = " " * max(0, (cols - width) // 2)
+        top = max(0, (rows - len(lines)) // 2)
+        out = "\033[K\n" * top + "\n".join(left + line + "\033[K" for line in lines)
+        sys.stdout.write("\033[H" + out + "\033[J")
+        sys.stdout.flush()
 
 
-def redraw(region_lines: int, header: str, screen: str) -> int:
-    """Replace the previous prompt + box in place; returns lines now in the region."""
-    if region_lines and sys.stdout.isatty():
-        sys.stdout.write(f"\033[{region_lines}F\033[J")
-    print(header)
-    print(screen)
-    return 1 + screen.count("\n") + 1
+# --------------------------------------------------------------------------- #
+# application
+# --------------------------------------------------------------------------- #
+def puzzle_number(day: date) -> int:
+    return (day - WORDLE_LAUNCH).days
 
 
-def play():
-    print(f"{GRAY}fetching word list...{RESET}", end="\r")
-    answers = get_answers()
-    valid_words = get_valid_guesses()
-    print(" " * 30, end="\r")  # clear the loading line
+def time_to_tomorrow() -> str:
+    now = datetime.now()
+    left = datetime.combine(now.date() + timedelta(days=1), datetime.min.time()) - now
+    hours, rest = divmod(int(left.total_seconds()), 3600)
+    return f"{hours}h {rest // 60:02d}m"
 
-    answer = random.choice(answers)
-    rank = {"correct": 2, "present": 1, "absent": 0}
 
-    letter_status = {}
-    history = []
-    region = 0  # terminal lines used by the current prompt + box
+class Quit(Exception):
+    pass
 
-    while len(history) < MAX_TRIES:
-        remaining = MAX_TRIES - len(history)
-        prompt = f"{BOLD}[{remaining}]{RESET} "
+
+class App:
+    def __init__(self, term: Terminal, store: Store):
+        self.term, self.store = term, store
+        self.valid = None
+        self.menu_index = 0
+
+    def key(self):
+        k = self.term.key()
+        if k == "quit":
+            raise Quit
+        return k
+
+    def notice(self, text: str, wait: bool = True):
+        self.term.paint(panel(["", text, ""], dim("press any key") if wait else ""))
+        if wait:
+            self.key()
+
+    def words(self) -> set:
+        if self.valid is None:
+            self.notice(dim("loading word list…"), wait=False)
+            self.valid = get_valid_guesses()
+        return self.valid
+
+    # main loop ---------------------------------------------------------------
+    def run(self, mode: str = None):
         try:
-            raw_input = input(prompt)
-            guess = raw_input.strip().lower()
-            if raw_input:
-                readline.add_history(raw_input)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            sys.exit(0)
-        region += 1
-        header = prompt + guess
-
-        if len(guess) != WORD_LEN or not guess.isalpha():
-            message = f"{YELLOW}enter a {WORD_LEN}-letter word{RESET}"
-            region = redraw(region, header, render_screen(history, letter_status, message))
-            continue
-        if guess not in valid_words:
-            message = f"{YELLOW}{guess.upper()}{RESET} {GRAY}is not in word list{RESET}"
-            region = redraw(region, header, render_screen(history, letter_status, message))
-            continue
-
-        result = score_guess(guess, answer)
-        history.append((guess, result))
-        for g, s in zip(guess, result):
-            current = letter_status.get(g)
-            if current is None or rank[s] > rank[current]:
-                letter_status[g] = s
-        message = ""
-
-        if guess == answer:
-            record_correct_word(answer)
-            praise = ["Genius", "Magnificent", "Impressive", "Splendid", "Great", "Phew"][len(history) - 1]
-            message = (f"{GREEN}{BOLD}{praise}!{RESET} {GRAY}solved in{RESET} "
-                       f"{BOLD}{len(history)}/{MAX_TRIES}{RESET}")
-            redraw(region, header, render_screen(history, letter_status, message))
+            while True:
+                mode = mode or self.menu()
+                if mode == "quit":
+                    return
+                if mode == "stats":
+                    self.stats_screen()
+                elif mode == "help":
+                    self.help_screen()
+                else:
+                    self.session(mode)
+                mode = None
+        except Quit:
             return
 
-        region = redraw(region, header, render_screen(history, letter_status, message))
+    # menu ------------------------------------------------------------------
+    def menu_items(self) -> list:
+        today = date.today()
+        result = self.store.daily_result(today)
+        if result:
+            today_desc = f"solved in {len(result['guesses'])}" if result["won"] else "missed"
+        elif self.store.progress(f"daily:{today}"):
+            today_desc = "in progress"
+        else:
+            today_desc = "not played yet"
+        total = puzzle_number(today) + 1
+        done = min(self.store.campaign_next, total)
+        return [
+            ("daily", "t", "Today's Wordle", f"#{puzzle_number(today)} · {today_desc}"),
+            ("random", "n", "Random", "endless practice"),
+            ("campaign", "c", "Campaign", f"day {done} of {total} solved" if done else "from Wordle #0"),
+            ("stats", "s", "Statistics", ""),
+            ("hard", "h", "Hard mode", f"{GREEN}on{RESET}" if self.store.hard else "off"),
+            ("help", "?", "Help", ""),
+            ("quit", "q", "Quit", ""),
+        ]
 
-    message = f"{GRAY}the word was{RESET} {BOLD}{answer.upper()}{RESET}"
-    region = redraw(region, header, render_screen(history, letter_status, message))
+    def menu(self) -> str:
+        while True:
+            items = self.menu_items()
+            rows = []
+            for i, (_, hotkey, label, desc) in enumerate(items):
+                if i == self.menu_index:
+                    rows.append(f"{GREEN}{BOLD}▸ {label:<16}{RESET}{GRAY}{desc}{RESET}")
+                else:
+                    rows.append(f"  {label:<16}{GRAY}{desc}{RESET}")
+            lines = logo() + [""] + block(rows) + [""]
+            footer = spread(dim("↑↓ move · enter select"), dim("q quit"))
+            self.term.paint(panel(lines, footer))
+
+            k = self.key()
+            if k in ("up", "k"):
+                self.menu_index = (self.menu_index - 1) % len(items)
+            elif k in ("down", "j"):
+                self.menu_index = (self.menu_index + 1) % len(items)
+            else:
+                if k == "enter":
+                    choice = items[self.menu_index][0]
+                else:
+                    choice = next((item[0] for item in items if item[1] == k), None)
+                    if choice:
+                        self.menu_index = [item[0] for item in items].index(choice)
+                if choice == "hard":
+                    self.store.hard = not self.store.hard
+                elif choice:
+                    return choice
+
+    # sessions ------------------------------------------------------------------
+    def session(self, mode: str):
+        """Keep playing games of one mode until the player leaves to the menu."""
+        while True:
+            game = self.next_game(mode)
+            if game is None or self.play(game) == "menu":
+                return
+            if mode == "daily":
+                return
+
+    def next_game(self, mode: str):
+        hard = self.store.hard
+        tag = " · hard" if hard else ""
+        today = date.today()
+
+        if mode == "random":
+            saved = self.store.progress("random")
+            if saved:
+                answer, guesses = saved["answer"], saved["guesses"]
+            else:
+                self.notice(dim("picking a word…"), wait=False)
+                answer, guesses = self.random_answer(), []
+            played = self.store.mode_stats("random")["played"]
+            return Game("random", "random", answer, f"Random · game {played + 1}{tag}", hard, guesses)
+
+        if mode == "daily":
+            day = today
+            title = f"Wordle #{puzzle_number(day)} · {day:%a %d %b %Y}{tag}"
+            result = self.store.daily_result(day)
+            if result:
+                return Game("daily", f"daily:{day}", result["answer"], title, hard,
+                            result["guesses"], day=day)
+        else:
+            number = self.store.campaign_next
+            day = WORDLE_LAUNCH + timedelta(days=number)
+            if day > today:
+                self.notice(f"{GREEN}{BOLD}All caught up!{RESET} you have played every Wordle up to today")
+                return None
+            total = puzzle_number(today) + 1
+            title = f"Campaign · Wordle #{number} · {day:%d %b %Y} · {number + 1}/{total}{tag}"
+
+        key = f"{mode}:{day if mode == 'daily' else number}"
+        saved = self.store.progress(key)
+        if saved:
+            answer, guesses = saved["answer"], saved["guesses"]
+        else:
+            self.notice(dim("fetching puzzle…"), wait=False)
+            try:
+                answer, guesses = get_daily_word(day.isoformat()).lower(), []
+            except FETCH_ERRORS:
+                self.notice(f"{YELLOW}couldn't fetch Wordle #{puzzle_number(day)}{RESET} · check your connection")
+                return None
+        return Game(mode, key, answer, title, hard, guesses, day=day, number=puzzle_number(day))
+
+    @staticmethod
+    def random_answer() -> str:
+        day = WORDLE_LAUNCH + timedelta(days=random.randint(0, puzzle_number(date.today())))
+        try:
+            return get_daily_word(day.isoformat()).lower()
+        except FETCH_ERRORS:
+            return random.choice(FALLBACK_WORDS)
+
+    # playing ------------------------------------------------------------------
+    def draw_game(self, game: Game, footer: str = "", history: list = None):
+        typing = history is None and not game.over
+        board = [""] + render_board(game.history if history is None else history,
+                                    game.current if typing else None) + [""]
+        keys = render_keys(game.status)
+        keys = [""] * (1 + (BOARD_H - len(keys)) // 2) + keys
+        header = pad(dim(" " + game.title), BOX_W)
+        self.term.paint([header] + box([board, keys], [LEFT_W, RIGHT_W], footer))
+
+    def reveal(self, game: Game, guess: str):
+        result = score_guess(guess, game.answer)
+        for shown in range(1, WORD_LEN + 1):
+            partial = result[:shown] + ["pending"] * (WORD_LEN - shown)
+            self.draw_game(game, history=game.history + [(guess, partial)])
+            time.sleep(0.15)
+        game.apply(guess)
+
+    def submit(self, game: Game) -> str:
+        """Returns an error message, or '' if the guess was played."""
+        guess = game.current
+        if len(guess) < WORD_LEN:
+            return "not enough letters"
+        if guess != game.answer and guess not in self.words():
+            return f"{BOLD}{guess.upper()}{RESET}{YELLOW} is not in the word list"
+        if game.hard:
+            error = hard_mode_error(guess, game.history)
+            if error:
+                return error
+        self.reveal(game, guess)
+        game.current = ""
+        if game.over:
+            self.store.record(game.mode, game.key, game.answer, game.guesses, game.won,
+                              day=game.day, number=game.number)
+        else:
+            self.store.save_progress(game.key, game.answer, game.guesses)
+        return ""
+
+    def play(self, game: Game) -> str:
+        """Returns 'next' to continue the session or 'menu' to leave it."""
+        self.words()
+        message = ""
+        while not game.over:
+            self.draw_game(game, f"{YELLOW}{message}{RESET}" if message else "")
+            k = self.key()
+            message = ""
+            if k == "esc":
+                return "menu"
+            if k == "backspace":
+                game.current = game.current[:-1]
+            elif k == "enter":
+                message = self.submit(game)
+            elif k and len(k) == 1 and k.isascii() and k.isalpha() and len(game.current) < WORD_LEN:
+                game.current += k.lower()
+
+        if game.won:
+            result = f"{GREEN}{BOLD}{PRAISE[len(game.history) - 1]}!{RESET} solved in {len(game.history)}/{MAX_TRIES}"
+        else:
+            result = f"the word was {BOLD}{game.answer.upper()}{RESET}"
+        if game.mode == "daily":
+            result += dim(f" · next in {time_to_tomorrow()}")
+            hint = dim("s stats · enter menu")
+        else:
+            hint = dim(f"enter next {'word' if game.mode == 'random' else 'day'} · s stats · esc menu")
+
+        while True:
+            self.draw_game(game, spread(result, hint))
+            k = self.key()
+            if k == "s":
+                self.stats_screen(game.mode)
+            elif k == "enter":
+                return "menu" if game.mode == "daily" else "next"
+            elif k in ("esc", "m"):
+                return "menu"
+
+    # screens ------------------------------------------------------------------
+    def stats_screen(self, mode: str = "daily"):
+        modes = list(MODE_NAMES)
+        tab = modes.index(mode)
+        while True:
+            mode = modes[tab]
+            stats = self.store.mode_stats(mode)
+            tabs = "     ".join(f"{GREEN}{BOLD}{MODE_NAMES[m]}{RESET}" if m == mode else dim(MODE_NAMES[m])
+                                for m in modes)
+            played = stats["played"]
+            numbers = [played, round(100 * stats["won"] / played) if played else 0,
+                       self.store.streak(mode), stats["max_streak"]]
+            labels = ["played", "win %", "streak", "max streak"]
+
+            top = max(stats["dist"]) or 1
+            bars = []
+            for i, count in enumerate(stats["dist"]):
+                bg = TILE_BG["correct"] if stats["last"] == i + 1 else TILE_BG["absent"]
+                width = round(30 * count / top)
+                bars.append(f"{i + 1} \033[1;38;5;{WHITE};48;5;{bg}m{' ' * width} {count} {RESET}")
+
+            lines = [tabs, "", "",
+                     "".join(pad(f"{BOLD}{n}{RESET}", 12, "center") for n in numbers),
+                     "".join(pad(dim(label), 12, "center") for label in labels),
+                     "", "", dim("guess distribution"), ""]
+            lines += block(bars)
+            if mode == "campaign":
+                total = puzzle_number(date.today()) + 1
+                done = min(self.store.campaign_next, total)
+                lines += ["", dim(f"progress {done}/{total} · {100 * done // total}% of all Wordles played")]
+            footer = spread(dim("←→ switch · esc back"),
+                            dim("lifetime words solved ") + f"{GREEN}{BOLD}{self.store.total_correct}{RESET}")
+            self.term.paint(panel(lines, footer))
+
+            k = self.key()
+            if k in ("left", "h"):
+                tab = (tab - 1) % len(modes)
+            elif k in ("right", "l", "\t"):
+                tab = (tab + 1) % len(modes)
+            elif k in ("esc", "enter", "q", "s"):
+                return
+
+    def help_screen(self):
+        sample = [("w", "correct"), ("e", "present"), ("a", "absent")]
+        lines = block([
+            f"{BOLD}How to play{RESET}",
+            f"Guess the hidden word in {MAX_TRIES} tries; each guess must be a real word.",
+            "",
+            "  ".join(cell(ch, TILE_BG[s]) for ch, s in sample)
+            + dim("   right spot · in the word, wrong spot · not in it"),
+            "",
+            f"{BOLD}Modes{RESET}",
+            f"  Today       the official Wordle of the day       {dim('wordle -t')}",
+            f"  Random      endless practice with past answers   {dim('wordle -n')}",
+            f"  Campaign    every Wordle from #0, day by day     {dim('wordle -c')}",
+            f"  Statistics  streaks and guess distribution       {dim('wordle -s')}",
+            "",
+            f"{BOLD}Keys{RESET}",
+            "  type to fill the row · enter submit · backspace delete",
+            "  esc back to the menu (your game is saved) · ctrl-c quit",
+            "",
+            f"{BOLD}Hard mode{RESET}  {dim('h in the menu, or wordle -H')}",
+            "  revealed hints must be used in every later guess",
+        ])
+        self.term.paint(panel(lines, dim("press any key")))
+        self.key()
 
 
 def main():
+    parser = argparse.ArgumentParser(prog="wordle", description="Wordle in your terminal.")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("-t", "--today", dest="mode", action="store_const", const="daily",
+                       help="play today's Wordle")
+    modes.add_argument("-n", "--random", dest="mode", action="store_const", const="random",
+                       help="endless random past Wordles")
+    modes.add_argument("-c", "--campaign", dest="mode", action="store_const", const="campaign",
+                       help="play every Wordle from day one, in order")
+    modes.add_argument("-s", "--stats", dest="mode", action="store_const", const="stats",
+                       help="show statistics")
+    parser.add_argument("-H", "--hard", action="store_true", help="turn hard mode on (remembered)")
+    args = parser.parse_args()
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("wordle needs an interactive terminal")
+
+    store = Store()
+    if args.hard:
+        store.hard = True
     try:
-        play()
+        with Terminal() as term:
+            App(term, store).run(args.mode)
     except KeyboardInterrupt:
-        print()
-        sys.exit(0)
+        pass
 
 
 if __name__ == "__main__":
