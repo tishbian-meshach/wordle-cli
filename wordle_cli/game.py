@@ -3,13 +3,14 @@ import argparse
 import os
 import random
 import re
+import select
 import shutil
 import signal
 import sys
 import termios
 import time
 import tty
-from collections import Counter
+from collections import Counter, deque
 from datetime import date, datetime, timedelta
 
 from .store import MAX_TRIES, Store
@@ -82,12 +83,22 @@ def spread(left: str, right: str, width: int = INNER_W - 2) -> str:
     return left + " " * max(1, width - visible_len(left) - visible_len(right)) + right
 
 
+SEP = object()  # a column line drawn as a horizontal rule joined to the borders
+
+
 def box(columns: list, widths: list, footer: str = None) -> list:
     height = max(len(col) for col in columns)
     columns = [col + [""] * (height - len(col)) for col in columns]
     out = ["╭" + "┬".join("─" * w for w in widths) + "╮"]
     for row in zip(*columns):
-        out.append("│" + "│".join(pad(t, w, "center") for t, w in zip(row, widths)) + "│")
+        rules = [t is SEP for t in row]
+        line = "├" if rules[0] else "│"
+        for i, (t, w) in enumerate(zip(row, widths)):
+            line += "─" * w if rules[i] else pad(t, w, "center")
+            if i + 1 < len(row):
+                line += {(True, True): "┼", (True, False): "┤", (False, True): "├"}.get(
+                    (rules[i], rules[i + 1]), "│")
+        out.append(line + ("┤" if rules[-1] else "│"))
     if footer is None:
         out.append("╰" + "┴".join("─" * w for w in widths) + "╯")
     else:
@@ -217,6 +228,7 @@ class Terminal:
         sys.stdout.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
         sys.stdout.flush()
         self.last = []
+        self.pending = deque()
         signal.signal(signal.SIGWINCH, lambda *_: self.paint())
         return self
 
@@ -226,17 +238,37 @@ class Terminal:
         sys.stdout.write("\033[?25h\033[?1049l")
         sys.stdout.flush()
 
-    def key(self):
-        data = os.read(self.fd, 32).decode(errors="ignore")
-        keys = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace",
-                "\x1b": "esc", "\x04": "quit",
-                "\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
-                "\x1b[C": "right", "\x1bOC": "right", "\x1b[D": "left", "\x1bOD": "left"}
-        if data in keys:
-            return keys[data]
-        if len(data) == 1 and data.isprintable():
-            return data
-        return None
+    KEYS = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace",
+            "\x1b": "esc", "\x04": "quit", "A": "up", "B": "down", "C": "right", "D": "left"}
+
+    def key(self, timeout: float = None):
+        """Next key press, or None if `timeout` seconds pass without one."""
+        if not self.pending:
+            if timeout is not None and not select.select([self.fd], [], [], max(0, timeout))[0]:
+                return None
+            self.pending.extend(self.parse(os.read(self.fd, 256).decode(errors="ignore")))
+        return self.pending.popleft() if self.pending else None
+
+    @classmethod
+    def parse(cls, data: str) -> list:
+        """Split a burst of input (fast typing arrives together) into keys."""
+        keys, i = [], 0
+        while i < len(data):
+            ch = data[i]
+            i += 1
+            if ch == "\x1b" and i < len(data) and data[i] in "[O":
+                end = i + 1
+                while end < len(data) and not "@" <= data[end] <= "~":
+                    end += 1
+                seq = data[i + 1:end + 1]
+                i = end + 1
+                if seq in ("A", "B", "C", "D"):  # arrows; other escape sequences are ignored
+                    keys.append(cls.KEYS[seq])
+            elif ch in cls.KEYS and len(ch) == 1 and not ch.isalpha():
+                keys.append(cls.KEYS[ch])
+            elif ch.isprintable():
+                keys.append(ch)
+        return keys
 
     def paint(self, lines: list = None):
         """Draw lines centred on screen, overwriting the previous frame."""
@@ -281,8 +313,8 @@ class App:
         self.valid = None
         self.menu_index = 0
 
-    def key(self):
-        k = self.term.key()
+    def key(self, timeout: float = None):
+        k = self.term.key(timeout)
         if k == "quit":
             raise Quit
         return k
@@ -405,8 +437,7 @@ class App:
             if day > today:
                 self.notice(f"{GREEN}{BOLD}All caught up!{RESET} you have played every Wordle up to today")
                 return None
-            total = puzzle_number(today) + 1
-            title = f"Campaign · Wordle #{number} · {day:%d %b %Y} · {number + 1}/{total}{tag}"
+            title = f"Campaign · #{number} · {day:%d %b %Y}{tag}"
 
         key = f"{mode}:{day if mode == 'daily' else number}"
         saved = self.store.progress(key)
@@ -430,22 +461,53 @@ class App:
             return random.choice(FALLBACK_WORDS)
 
     # playing ------------------------------------------------------------------
-    def draw_game(self, game: Game, footer: str = "", history: list = None):
-        typing = history is None and not game.over
+    def draw_game(self, game: Game, message: str = "", history: list = None, tips: str = None,
+                  typing: bool = None):
+        if typing is None:
+            typing = history is None and not game.over
         board = [""] + render_board(game.history if history is None else history,
                                     game.current if typing else None) + [""]
-        keys = render_keys(game.status)
-        keys = [""] * (1 + (BOARD_H - len(keys)) // 2) + keys
-        header = pad(dim(" " + game.title), BOX_W)
-        self.term.paint([header] + box([board, keys], [LEFT_W, RIGHT_W], footer))
+        name, *details = game.title.split(" · ")
+        title = f"{BOLD}{name}{RESET}" + "".join(dim(f" · {d}") for d in details)
+        # title lines up with the first board row, tips with the last one
+        if tips is None:  # while typing, a message takes the place of the key tips
+            bottom = [message or dim("enter submit · ⌫ delete · esc menu"), ""]
+        else:
+            bottom = [message, tips] if message else [tips, ""]
+        right = ["", title, SEP, ""] + render_keys(game.status) + ["", SEP] + bottom
+        self.term.paint(box([board, right], [LEFT_W, RIGHT_W]))
 
     def reveal(self, game: Game, guess: str):
+        """Flip the tiles one by one; keys typed meanwhile go to the next row."""
         result = score_guess(guess, game.answer)
+        last_row = guess == game.answer or len(game.history) + 1 >= MAX_TRIES
+        later = []
         for shown in range(1, WORD_LEN + 1):
             partial = result[:shown] + ["pending"] * (WORD_LEN - shown)
-            self.draw_game(game, history=game.history + [(guess, partial)])
-            time.sleep(0.15)
+            deadline = time.time() + 0.15
+            while True:
+                self.draw_game(game, history=game.history + [(guess, partial)], typing=not last_row)
+                k = self.key(deadline - time.time())
+                if k is None:
+                    break
+                if last_row:
+                    continue  # nothing to type into; don't let keys skip the result
+                if later or not self.type_key(game, k):
+                    later.append(k)  # enter and anything after it: handled once revealed
         game.apply(guess)
+        self.term.pending.extendleft(reversed(later))
+
+    @staticmethod
+    def type_key(game: Game, k: str) -> bool:
+        """Apply a letter/backspace to the row being typed; False for other keys."""
+        if k == "backspace":
+            game.current = game.current[:-1]
+        elif k and len(k) == 1 and k.isascii() and k.isalpha():
+            if len(game.current) < WORD_LEN:
+                game.current += k.lower()
+        else:
+            return False
+        return True
 
     def submit(self, game: Game) -> str:
         """Returns an error message, or '' if the guess was played."""
@@ -458,8 +520,8 @@ class App:
             error = hard_mode_error(guess, game.history)
             if error:
                 return error
-        self.reveal(game, guess)
         game.current = ""
+        self.reveal(game, guess)
         if game.over:
             self.store.record(game.mode, game.key, game.answer, game.guesses, game.won,
                               day=game.day, number=game.number)
@@ -477,25 +539,22 @@ class App:
             message = ""
             if k == "esc":
                 return "menu"
-            if k == "backspace":
-                game.current = game.current[:-1]
-            elif k == "enter":
+            if k == "enter":
                 message = self.submit(game)
-            elif k and len(k) == 1 and k.isascii() and k.isalpha() and len(game.current) < WORD_LEN:
-                game.current += k.lower()
+            else:
+                self.type_key(game, k)
 
         if game.won:
             result = f"{GREEN}{BOLD}{PRAISE[len(game.history) - 1]}!{RESET} solved in {len(game.history)}/{MAX_TRIES}"
         else:
             result = f"the word was {BOLD}{game.answer.upper()}{RESET}"
         if game.mode == "daily":
-            result += dim(f" · next in {time_to_tomorrow()}")
-            hint = dim("s stats · enter menu")
+            hint = dim(f"next in {time_to_tomorrow()} · s stats · enter menu")
         else:
             hint = dim(f"enter next {'word' if game.mode == 'random' else 'day'} · s stats · esc menu")
 
         while True:
-            self.draw_game(game, spread(result, hint))
+            self.draw_game(game, result, tips=hint)
             k = self.key()
             if k == "s":
                 self.stats_screen(game.mode)
